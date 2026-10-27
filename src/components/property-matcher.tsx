@@ -6,7 +6,7 @@ import { supabase } from "@/lib/supabase";
 import type { Lead } from "@/lib/types";
 import { inr, type Property } from "@/lib/property-types";
 type Match = { property:Property; score:number; positives:string[]; cautions:string[]; aiReason:string|null };
-type ResponseBody = {error?:string;warning?:string;source?:"ollama"|"rules";matches?:Match[];preferences?:{city:string;locality:string;maxBudget:number|null;bedrooms:number|null}};
+type ResponseBody = {error?:string;warning?:string;source?:"groq"|"ollama"|"rules";matches?:Match[];preferences?:{city:string;locality:string;maxBudget:number|null;bedrooms:number|null}};
 export function PropertyMatcher({lead}:{lead:Lead}){
  const [city,setCity]=useState(lead.city);
  const [locality,setLocality]=useState("");
@@ -25,7 +25,7 @@ export function PropertyMatcher({lead}:{lead:Lead}){
    }catch(err){setError(err instanceof Error?err.message:"Matching failed");}finally{setBusy(false);}
  }
  return <section className="ai-review-box phase4b-match">
-   <div className="ai-review-heading"><div><span className="eyebrow">PHASE 4B · INVENTORY-AWARE</span><h3><BrainCircuit size={17}/> Match verified properties</h3><p>Filters and ranks only Active listings in your own account. Ollama adds optional explanations; no invented listings.</p></div></div>
+   <div className="ai-review-heading"><div><span className="eyebrow">PHASE 4B · INVENTORY-AWARE</span><h3><BrainCircuit size={17}/> Match verified properties</h3><p>Filters and ranks only Active listings in your own account. Hosted AI (or local Ollama) adds optional explanations; no invented listings.</p></div></div>
    <form className="phase4b-match-form" onSubmit={match}>
      <label>City<input className="field" value={city} onChange={e=>setCity(e.target.value)} maxLength={90}/></label>
      <label>Preferred locality (optional)<input className="field" value={locality} onChange={e=>setLocality(e.target.value)} placeholder="Bailey Road" maxLength={120}/></label>
@@ -34,7 +34,7 @@ export function PropertyMatcher({lead}:{lead:Lead}){
      <button type="submit" disabled={busy} className="btn btn-dark w-full"><Search size={16}/>{busy?"Finding matches…":"Match properties"}</button>
    </form>
    {error&&<p className="login-error" role="alert">{error}</p>}
-   {result&&<div className="phase4b-match-results"><div className="phase4b-match-summary"><strong>{result.matches?.length??0} recommended listing(s)</strong><span>{result.source==="ollama"?"Ollama-assisted explanation":"Rule-based shortlist"}</span></div>
+   {result&&<div className="phase4b-match-results"><div className="phase4b-match-summary"><strong>{result.matches?.length??0} recommended listing(s)</strong><span>{result.source==="groq"?"Cloud AI explanation":result.source==="ollama"?"Ollama-assisted explanation":"Rule-based shortlist"}</span></div>
      {result.warning&&<p className="phase4b-muted">{result.warning}</p>}
      {result.preferences&&<p className="phase4b-muted">Matching on {result.preferences.city||"any city"}, {result.preferences.bedrooms?`${result.preferences.bedrooms} BHK`:"any bedroom count"}, {result.preferences.maxBudget?`max ${inr(result.preferences.maxBudget)}`:"budget not specified"}. Review before sharing.</p>}
      {(result.matches??[]).map(m=><article className="phase4b-match-result" key={m.property.id}>
