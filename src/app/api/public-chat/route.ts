@@ -1,4 +1,5 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
+import { isIP } from "node:net";
 import { generateAI } from "@/lib/ai-provider";
 import { NextResponse } from "next/server";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
@@ -16,16 +17,33 @@ const phoneValid = (s:string) => /^[+0-9 ()-]{7,20}$/.test(s) && s.replace(/\D/g
 const contactsScrub = (value:string) => value.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi,"[email]")
   .replace(/(?:\+?91[ -]?)?[6-9]\d{4}[ -]?\d{5}/g,"[phone]");
 
-// Local rate limiting is a demo safeguard, not a multi-instance production security control.
-// Add persistent IP/session quotas and bot protection before accepting real public traffic.
-const buckets = new Map<string,{count:number;reset:number}>();
-function allow(ip: string, limit: number) {
-  const time = Date.now();
-  if (buckets.size > 5000) buckets.clear();
-  const current = buckets.get(ip);
-  if (!current || current.reset < time) { buckets.set(ip,{count:1,reset:time+60000}); return true; }
-  if (current.count >= limit) return false;
-  current.count += 1; return true;
+// Persistent, atomic quotas stored in Supabase so Vercel instances share counters.
+// Only this server uses the privileged RPC; browser clients have no permission.
+type RateScope = "get_ip_min" | "post_ip_min" | "start_ip_min" | "start_site_hour"
+  | "message_session_min" | "message_site_hour" | "message_site_day" | "visit_session_min";
+function clientIp(request: Request): string {
+  // Vercel overwrites forwarded IP headers on its deployment network.
+  // On localhost these are only best-effort development signals.
+  const forwarded = request.headers.get("x-vercel-forwarded-for") ?? request.headers.get("x-forwarded-for") ?? "";
+  const candidate = forwarded.split(",")[0]?.trim() ?? "";
+  return isIP(candidate) ? candidate : "unknown";
+}
+function rateIdentity(value: string): string {
+  const secret = process.env.SUPABASE_SECRET_KEY;
+  if (!secret) throw new Error("Missing Supabase secret key for rate limiting.");
+  return createHmac("sha256", secret).update(value).digest("hex");
+}
+async function consumeRate(
+  db: SupabaseClient, scope: RateScope, identity: string, limit: number, windowSeconds: 60 | 3600 | 86400,
+): Promise<boolean> {
+  const { data, error } = await db.rpc("consume_public_chat_rate_limit", {
+    p_scope: scope, p_subject_hash: rateIdentity(identity), p_limit: limit, p_window_seconds: windowSeconds,
+  });
+  if (error) {
+    console.error("Rate limiter failed:", error.message);
+    throw new Error("Public chat protection is temporarily unavailable.");
+  }
+  return data === true;
 }
 function client(): SupabaseClient {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -103,7 +121,10 @@ function sameOrigin(request:Request) {
 export async function GET(request:Request) {
   try {
     const slug=bounded(new URL(request.url).searchParams.get("slug"),60);
-    const db=client(); const site=await findSite(db,slug);
+    const db=client();
+    if (!await consumeRate(db,"get_ip_min",`ip:${clientIp(request)}`,60,60))
+      return reject("Too many requests. Please try again shortly.",429);
+    const site=await findSite(db,slug);
     if(!site)return reject("Public buyer chat is unavailable.",404);
     const inventory=await publicListings(db,site);
     return respond({brand:site.business_name,welcome:site.welcome_message,...inventory});
@@ -112,18 +133,23 @@ export async function GET(request:Request) {
 
 export async function POST(request:Request) {
   if (!sameOrigin(request)) return reject("Invalid request origin.",403);
-  const ip=request.headers.get("x-forwarded-for")?.split(",")[0]?.trim()||"local";
-  if (!allow(ip,20)) return reject("Too many requests. Please try again shortly.",429);
+  const ip=clientIp(request);
   let body:Record<string,unknown>;
   try { if(Number(request.headers.get("content-length")||0)>12000)return reject("Message too large.",413);body=await safeJson(request);}
   catch{return reject("Invalid JSON.",400);}
   const slug=bounded(body.slug,60); const action=bounded(body.action,25);
   if (!slug) return reject("Missing chatbot link.",400);
   try {
-    const db=client(); const site=await findSite(db,slug);
+    const db=client();
+    if (!await consumeRate(db,"post_ip_min",`ip:${ip}`,20,60))
+      return reject("Too many requests. Please try again shortly.",429);
+    const site=await findSite(db,slug);
     if(!site)return reject("Public buyer chat is unavailable.",404);
     if(action==="start") {
-      if(!allow(`start:${ip}`,4)) return reject("Too many new enquiries. Try again shortly.",429);
+      if (!await consumeRate(db,"start_ip_min",`ip:${ip}`,4,60))
+        return reject("Too many new enquiries. Try again shortly.",429);
+      if (!await consumeRate(db,"start_site_hour",`site:${site.id}`,60,3600))
+        return reject("This chatbot has received too many enquiries. Please try later.",429);
       if(body.website) return reject("Unable to submit enquiry.",400); // honeypot
       if(body.consent!==true) return reject("Please agree to submit your enquiry.",400);
       const name=bounded(body.name,90),phone=bounded(body.phone,20),email=bounded(body.email,150);
@@ -156,6 +182,12 @@ export async function POST(request:Request) {
     }
 
     if(action==="message") {
+      if (!await consumeRate(db,"message_session_min",`session:${session.id}`,6,60))
+        return reject("Too many messages. Please wait a minute.",429);
+      if (!await consumeRate(db,"message_site_hour",`site:${site.id}`,80,3600))
+        return reject("Chat is busy. Please try again later.",429);
+      if (!await consumeRate(db,"message_site_day",`site:${site.id}`,300,86400))
+        return reject("Today's chatbot message limit has been reached. Please contact the agency.",429);
       const message=bounded(body.message,700);
       if(message.length<2 || message.length>700)return reject("Enter a message between 2 and 700 characters.",400);
       const {data:previous,error:historyError}=await db.from("lead_conversations").select("role,message,created_at")
@@ -202,6 +234,8 @@ export async function POST(request:Request) {
     }
 
     if(action==="visit") {
+      if (!await consumeRate(db,"visit_session_min",`session:${session.id}`,4,60))
+        return reject("Too many visit requests. Please try again shortly.",429);
       const propertyId=bounded(body.propertyId,45),slotId=bounded(body.slotId,45);
       if(!uuidPattern.test(propertyId)||!uuidPattern.test(slotId))return reject("Choose a property and time slot.",400);
       const {data:p,error:pError}=await db.from("properties").select("id").eq("id",propertyId).eq("user_id",site.user_id).eq("listing_status","Active").maybeSingle();
